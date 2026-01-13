@@ -418,6 +418,9 @@ function parseExtraneousPatterns(text) {
   if (lower.includes('wants to give')) {
     return { type: 'extraneous', reason: 'trade offer message' };
   }
+  if (lower.includes('proposed counter offer')) {
+    return { type: 'extraneous', reason: 'trade counter offer message' };
+  }
   if (lower.includes('bot is selecting cards to discard for')) {
     return { type: 'extraneous', reason: 'bot discard message' };
   }
