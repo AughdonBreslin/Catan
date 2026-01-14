@@ -10,6 +10,7 @@ const OPPONENTS_POLL_INTERVAL_MS = 1000;
 let opponentsPollId = null;
 let opponentsReady = false;
 const logsCache = new Map(); // index -> { text, processed }
+let lastProcessedLogIndex = null;
 const resourcesState = new Map(); // player -> resource counts
 
 // Function to extract opponent usernames
@@ -104,7 +105,6 @@ function extractGameLogs() {
 
   const items = scroller.querySelectorAll('[data-index]');
   const latestVisible = [];
-  const newlyCached = [];
 
   items.forEach((item) => {
     const messageSpan = item.querySelector('[class*="scrollItemContainer-"] [class*="feedMessage-"] [class*="messagePart-"]');
@@ -118,9 +118,6 @@ function extractGameLogs() {
     const processed = existing?.processed || false;
     const entry = { text, processed };
     latestVisible.push({ index: idx, text, processed });
-    if (!existing) {
-      newlyCached.push({ index: idx, text, processed });
-    }
     logsCache.set(idx, entry);
   });
 
@@ -130,17 +127,12 @@ function extractGameLogs() {
 
 //   console.log(`[logs] visible now: ${latestVisible.length}, cached total: ${merged.length}`);
 
-  // Attempt processing immediately for newly cached entries
-  if (newlyCached.length > 0) {
-    processLogsForResources(newlyCached);
-  }
-
   return merged;
 }
 
-const RESOURCE_ALTS = new Set(['Lumber', 'Brick', 'Wool', 'Grain', 'Ore']);
+const RESOURCE_ALTS = new Set(['lumber', 'brick', 'wool', 'grain', 'ore']);
 const DICE_ALTS = new Set(['dice_1', 'dice_2', 'dice_3', 'dice_4', 'dice_5', 'dice_6']);
-const CARD_ALTS = new Set(['Development Card', 'Resource Card']);
+const CARD_ALTS = new Set(['development card', 'resource card']);
 
 function buildLogMessage(spanEl) {
   const parts = [];
@@ -150,7 +142,7 @@ function buildLogMessage(spanEl) {
       if (text) parts.push(text);
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       if (node.tagName === 'IMG') {
-        const alt = node.getAttribute('alt');
+        const alt = node.getAttribute('alt').trim().toLowerCase();
         if (RESOURCE_ALTS.has(alt) || DICE_ALTS.has(alt) || CARD_ALTS.has(alt)) {
           parts.push(alt);
         }
@@ -163,7 +155,28 @@ function buildLogMessage(spanEl) {
   return parts.join(' ');
 }
 
-const RESOURCE_KEYS = ['Lumber', 'Brick', 'Wool', 'Grain', 'Ore'];
+const RESOURCE_KEYS = ['lumber', 'brick', 'wool', 'grain', 'ore'];
+
+function normalizePlayerResourceFloors(playerName, store) {
+  if (!store || playerName === 'Bank') return;
+
+  let totalDeficit = 0;
+  RESOURCE_KEYS.forEach((key) => {
+    const val = Number(store[key] ?? 0);
+    if (Number.isNaN(val)) {
+      store[key] = 0;
+      return;
+    }
+    if (val < 0) {
+      totalDeficit += Math.abs(val);
+      store[key] = 0;
+    }
+  });
+
+  if (totalDeficit > 0 && typeof store.UnknownStole === 'number') {
+    store.UnknownStole -= totalDeficit;
+  }
+}
 
 function ensurePlayerResources(player) {
   if (!resourcesState.has(player)) {
@@ -180,6 +193,9 @@ function ensurePlayerResources(player) {
   }
   return resourcesState.get(player);
 }
+
+// Allow other content-script files to use shared state helpers.
+window.ensurePlayerResources = ensurePlayerResources;
 
 function initializeBank() {
   if (!resourcesState.has('Bank')) {
@@ -202,6 +218,7 @@ function publishResources() {
   };
   console.log('[resources] publishing', payload);
   window.postMessage(payload, '*');
+  window.renderPlayerResourcePanels?.();
 }
 
 function parseStartingResources(text) {
@@ -330,7 +347,7 @@ function parseStoleResource(text) {
   const match = text.match(/^(.*?)\s+stole\s+(.*?)\s+from\s+(.*)$/i);
   if (!match) return null;
   let robber = match[1] ? match[1].trim() : '';
-  const resourceStr = match[2] ? match[2].trim() : '';
+  let resourceStr = match[2] ? match[2].trim() : '';
   let victim = match[3] ? match[3].trim() : '';
   if (!robber || !victim) return null;
 
@@ -342,15 +359,35 @@ function parseStoleResource(text) {
     victim = 'PieEater';
   }
 
-  // resourceStr should be either a resource name or "Resource Card"
+  // resourceStr should be either a resource name or "resource card"
   let resource = null;
-  if (RESOURCE_ALTS.has(resourceStr)) {
+  if (RESOURCE_ALTS.has(resourceStr.toLowerCase())) {
     resource = resourceStr;
-  } else if (resourceStr === 'Resource Card') {
-    resource = 'Resource Card';
+  } else if (resourceStr === 'resource card') {
+    resource = 'resource card';
   }
 
   return { robber, victim, resource };
+}
+
+function parseMonopolyStole(text) {
+  // Format: <player> stole <number> <resource>
+  // (e.g. Monopoly development card)
+  const match = text.match(/^(.*?)\s+stole\s+(\d+)\s+([A-Za-z]+)\s*$/);
+  if (!match) return null;
+
+  let player = match[1] ? match[1].trim() : '';
+  const count = match[2] ? Number(match[2]) : NaN;
+  const resourceStr = match[3] ? match[3].trim() : '';
+  if (!player || Number.isNaN(count) || count <= 0) return null;
+
+  let resource = null;
+  RESOURCE_ALTS.forEach((alt) => {
+    if (alt === resourceStr.toLowerCase()) resource = alt;
+  });
+  if (!resource) return null;
+
+  return { player, count, resource };
 }
 
 function parseDiscardedResources(text) {
@@ -366,7 +403,7 @@ function parseDiscardedResources(text) {
 }
 
 function parseResourceList(str) {
-  const tokens = str.split(/\s+/);
+  const tokens = str.toLowerCase().split(/\s+/);
   const resources = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const cleaned = tokens[i].replace(/[.,:;]/g, '');
@@ -403,6 +440,9 @@ function parseExtraneousPatterns(text) {
   // System messages
   if (lower === '') {
     return { type: 'extraneous', reason: 'spacer message' };
+  }
+  if (lower.includes('is inactive')) {
+    return { type: 'extraneous', reason: 'inactive player message' };
   }
   if (lower.includes('disconnected')) {
     return { type: 'extraneous', reason: 'disconnect message' };
@@ -503,6 +543,11 @@ function classifyResourceLog(text) {
     return { type: 'gaveBank', data: gaveBankParsed };
   }
 
+  const monopolyParsed = parseMonopolyStole(text);
+  if (monopolyParsed) {
+    return { type: 'monopolyStole', data: monopolyParsed };
+  }
+
   const stoleResourceParsed = parseStoleResource(text);
   if (stoleResourceParsed) {
     console.log('[parse] stole resource detected:', stoleResourceParsed);
@@ -528,12 +573,44 @@ function classifyResourceLog(text) {
 
 function processLogsForResources(logs) {
   let updated = false;
-  logs.forEach((entry) => {
+  const sortedLogs = Array.isArray(logs) ? [...logs].sort((a, b) => a.index - b.index) : [];
+  if (sortedLogs.length === 0) return;
+
+  // The feed is virtualized; on initial load we may only see a slice of logs.
+  // Don’t start processing mid-stream, otherwise we can never reconstruct correct
+  // resource state. As soon as index 0 becomes available, processing will start.
+  if (lastProcessedLogIndex === null && sortedLogs[0]?.index !== 0) {
+    return;
+  }
+
+  let expectedNextIndex = lastProcessedLogIndex === null ? sortedLogs[0].index : lastProcessedLogIndex + 1;
+
+  for (let i = 0; i < sortedLogs.length; i += 1) {
+    const entry = sortedLogs[i];
+    if (!entry || typeof entry.index !== 'number') continue;
+
+    // Never process out of order or across gaps.
+    if (entry.index < expectedNextIndex) {
+      continue;
+    }
+    if (entry.index !== expectedNextIndex) {
+      break;
+    }
+
     const cacheEntry = logsCache.get(entry.index);
-    if (cacheEntry?.processed) return;
+    if (cacheEntry?.processed) {
+      lastProcessedLogIndex = entry.index;
+      expectedNextIndex = lastProcessedLogIndex + 1;
+      continue;
+    }
 
     const classified = classifyResourceLog(entry.text);
-    if (!classified) return;
+    // If we can't classify/understand this log yet, we must stop.
+    if (!classified) {
+      break;
+    }
+
+    let processedThisEntry = false;
 
     switch (classified.type) {
       case 'startingResources': {
@@ -547,6 +624,8 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied starting resources', player, resources, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'tookResources': {
@@ -560,6 +639,8 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied took resources', player, resources, '=>', store, 'Bank =>', bankStore);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'gotResources': {
@@ -573,6 +654,8 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied got resources', player, resources, '=>', store, 'Bank =>', bankStore);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'tradeResources': {
@@ -595,6 +678,9 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied trade', { trader, tradee, gave, got, traderStore, tradeeStore });
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(trader, traderStore);
+        normalizePlayerResourceFloors(tradee, tradeeStore);
         break;
       }
       case 'boughtDevelopmentCard': {
@@ -603,13 +689,15 @@ function processLogsForResources(logs) {
         const bankStore = ensurePlayerResources('Bank');
         
         // Buying dev card costs: 1 Wool, 1 Grain, 1 Ore
-        store['Wool']  -= 1; bankStore['Wool']  += 1;
-        store['Grain'] -= 1; bankStore['Grain'] += 1;
-        store['Ore']   -= 1; bankStore['Ore']   += 1;
+        store['wool']  -= 1; bankStore['wool']  += 1;
+        store['grain'] -= 1; bankStore['grain'] += 1;
+        store['ore']   -= 1; bankStore['ore']   += 1;
         
         updated = true;
         console.log('[resources] applied bought development card', player, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'builtRoad': {
@@ -618,12 +706,14 @@ function processLogsForResources(logs) {
         const bankStore = ensurePlayerResources('Bank');
         
         // Building a road costs: 1 Lumber, 1 Brick
-        store['Lumber'] -= 1; bankStore['Lumber'] += 1;
-        store['Brick']  -= 1; bankStore['Brick']  += 1;
+        store['lumber'] -= 1; bankStore['lumber'] += 1;
+        store['brick']  -= 1; bankStore['brick']  += 1;
         
         updated = true;
         console.log('[resources] applied built road', player, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'builtSettlement': {
@@ -632,14 +722,16 @@ function processLogsForResources(logs) {
         const bankStore = ensurePlayerResources('Bank');
         
         // Building a settlement costs: 1 Lumber, 1 Brick, 1 Wool, 1 Grain
-        store['Lumber'] -= 1; bankStore['Lumber'] += 1;
-        store['Brick']  -= 1; bankStore['Brick']  += 1;
-        store['Wool']   -= 1; bankStore['Wool']   += 1;
-        store['Grain']  -= 1; bankStore['Grain']  += 1;
+        store['lumber'] -= 1; bankStore['lumber'] += 1;
+        store['brick']  -= 1; bankStore['brick']  += 1;
+        store['wool']   -= 1; bankStore['wool']   += 1;
+        store['grain']  -= 1; bankStore['grain']  += 1;
         
         updated = true;
         console.log('[resources] applied built settlement', player, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'builtCity': {
@@ -648,12 +740,14 @@ function processLogsForResources(logs) {
         const bankStore = ensurePlayerResources('Bank');
         
         // Building a city costs: 3 Ore, 2 Grain
-        store['Ore']   -= 3; bankStore['Ore']   += 3;
-        store['Grain'] -= 2; bankStore['Grain'] += 2;
+        store['ore']   -= 3; bankStore['ore']   += 3;
+        store['grain'] -= 2; bankStore['grain'] += 2;
         
         updated = true;
         console.log('[resources] applied built city', player, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'gaveBank': {
@@ -676,12 +770,37 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied bank trade', player, { gave, took }, '=>', store, 'Bank =>', bankStore);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
+        break;
+      }
+      case 'monopolyStole': {
+        const { player, count, resource } = classified.data;
+        const playerStore = ensurePlayerResources(player);
+
+        // Ensure we have the latest set of players before zeroing.
+        const usernames = extractOpponentUsernames();
+        usernames.forEach((name) => ensurePlayerResources(name));
+
+        playerStore[resource] += count;
+
+        resourcesState.forEach((store, name) => {
+          if (name === 'Bank' || name === player) return;
+          store[resource] = 0;
+          normalizePlayerResourceFloors(name, store);
+        });
+
+        updated = true;
+        console.log('[resources] applied monopoly', player, 'stole', count, resource);
+        logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, playerStore);
         break;
       }
       case 'stoleResource': {
         const { robber, victim, resource } = classified.data;
         
-        // Only handle when we know the specific resource (not "Resource Card")
+        // Only handle when we know the specific resource (not "resource card")
         if (resource && RESOURCE_ALTS.has(resource)) {
           const robberStore = ensurePlayerResources(robber);
           const victimStore = ensurePlayerResources(victim);
@@ -693,7 +812,10 @@ function processLogsForResources(logs) {
           updated = true;
           console.log('[resources] applied rob', robber, 'stole', resource, 'from', victim, '=>', { robberStore, victimStore });
           logsCache.set(entry.index, { text: entry.text, processed: true });
-        } else if (resource === 'Resource Card') {
+          processedThisEntry = true;
+          normalizePlayerResourceFloors(robber, robberStore);
+          normalizePlayerResourceFloors(victim, victimStore);
+        } else if (resource === 'resource card') {
           const robberStore = ensurePlayerResources(robber);
           const victimStore = ensurePlayerResources(victim);
           
@@ -704,6 +826,9 @@ function processLogsForResources(logs) {
           updated = true;
           console.log('[resources] applied unknown rob', robber, 'stole unknown from', victim, '=>', { robberStore, victimStore });
           logsCache.set(entry.index, { text: entry.text, processed: true });
+          processedThisEntry = true;
+          normalizePlayerResourceFloors(robber, robberStore);
+          normalizePlayerResourceFloors(victim, victimStore);
         } else {
           console.log('[resources] untracked robbery?', { robber, victim, resource });
         }
@@ -723,17 +848,29 @@ function processLogsForResources(logs) {
         updated = true;
         console.log('[resources] applied discarded', player, discarded, '=>', store, 'Bank =>', bankStore);
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
+        normalizePlayerResourceFloors(player, store);
         break;
       }
       case 'extraneous': {
         // Just mark as processed
         logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
         break;
       }
       default:
         break;
     }
-  });
+
+    // If we didn't mark this entry processed, we must stop here.
+    if (!processedThisEntry) {
+      break;
+    }
+
+    lastProcessedLogIndex = entry.index;
+    expectedNextIndex = lastProcessedLogIndex + 1;
+  }
+
   if (updated) {
     publishResources();
     // also refresh opponents to reflect updated resources
@@ -768,6 +905,31 @@ const observer = new MutationObserver((mutations) => {
   mutations.forEach((mutation) => {
     const opponentsContainer = document.querySelector('[class*="opponentsScrollContainerScrollContent-"]');
     const feedScroller = getFeedScroller();
+
+    const isCatanTrackerMutation = (() => {
+      const hasMarkerInNode = (node) => {
+        if (!node) return false;
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const el = /** @type {Element} */ (node);
+          return !!(el.closest?.('[data-catan-tracker]') || el.querySelector?.('[data-catan-tracker]'));
+        }
+        if (node.nodeType === Node.TEXT_NODE) {
+          return !!node.parentElement?.closest?.('[data-catan-tracker]');
+        }
+        return false;
+      };
+
+      if (hasMarkerInNode(mutation.target)) return true;
+      if (mutation.type === 'childList') {
+        for (const n of mutation.addedNodes) {
+          if (hasMarkerInNode(n)) return true;
+        }
+        for (const n of mutation.removedNodes) {
+          if (hasMarkerInNode(n)) return true;
+        }
+      }
+      return false;
+    })();
     
     if (mutation.type === 'childList') {
       if (mutation.addedNodes.length > 0) {
@@ -779,6 +941,7 @@ const observer = new MutationObserver((mutations) => {
       
       // Check if the mutation is in the opponents container
       if (opponentsContainer && (mutation.target === opponentsContainer || mutation.target.closest('[class*="opponentsScrollContainerScrollContent-"]'))) {
+        if (isCatanTrackerMutation) return;
         // console.log('[observer] childList mutation in opponents area');
         const usernames = extractOpponentUsernames();
         publishOpponents(usernames);
@@ -802,6 +965,7 @@ const observer = new MutationObserver((mutations) => {
       
       // Also check if the opponents container was just created/modified
       if (mutation.target.classList.contains('opponentPlayerRow')) {
+        if (isCatanTrackerMutation) return;
         // console.log('[observer] attribute change on opponent row');
         const usernames = extractOpponentUsernames();
         publishOpponents(usernames);
@@ -848,26 +1012,6 @@ if (document.readyState === 'loading') {
 } else {
   initializeObserver();
 }
-
-// Extract and log initial opponent usernames if they exist
-setTimeout(() => {
-  const usernames = extractOpponentUsernames();
-  if (usernames.length > 0) {
-    publishOpponents(usernames);
-    // console.log('Initial opponents:', usernames);
-  } else {
-    // console.log('Initial opponent usernames: none found yet');
-  }
-
-  const logs = extractGameLogs();
-  if (logs.length > 0) {
-    publishGameLogs(logs);
-    processLogsForResources(logs);
-    // console.log('Initial logs extracted:', logs.length);
-  } else {
-    // console.log('Initial logs: none found yet');
-  }
-}, 500);
 
 // Send messages to the background script for logging or further processing
 window.addEventListener('message', (event) => {
