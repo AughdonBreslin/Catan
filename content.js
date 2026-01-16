@@ -450,6 +450,12 @@ function parseExtraneousPatterns(text) {
   if (lower.includes('reconnected')) {
     return { type: 'extraneous', reason: 'reconnect message' };
   }
+  if (lower.includes('last player remaining')) {
+    return { type: 'extraneous', reason: 'last player warning message' };
+  }
+  if (lower.includes('has left the game')) {
+    return { type: 'extraneous', reason: 'player left message' };
+  }
 
   // Game action messages
   if (lower.includes('rolled')) {
@@ -480,6 +486,9 @@ function parseExtraneousPatterns(text) {
   }
   if (lower.includes("is blocked by the robber. no resources produced")) {
     return { type: 'extraneous', reason: 'robber block message' };
+  }
+  if (lower.includes("has no cards")) {
+    return { type: 'extraneous', reason: 'no cards to steal message' };
   }
 
   // Development card messages

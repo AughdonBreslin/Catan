@@ -32,9 +32,19 @@
     return trimmed;
   }
 
+  function getOpponentCountFromDom() {
+    const opponentsContainer = document.querySelector('[class*="opponentsScrollContainerScrollContent-"]');
+    if (!opponentsContainer) return 0;
+    const rows = opponentsContainer.querySelectorAll('[class*="opponentPlayerRow-"]');
+    return rows?.length ?? 0;
+  }
+
   function renderPlayerResourcePanels() {
     // Also patch Bank UI counts (if present) using our tracked Bank store.
     renderBankCountsIfMissing();
+
+    // If there's only one opponent, unknown steals/losses are redundant noise.
+    const shouldRenderUnknown = getOpponentCountFromDom() > 1;
 
     const panels = document.querySelectorAll('[class*="playerInformation-"]');
     if (!panels || panels.length === 0) return;
@@ -117,7 +127,10 @@
       }
 
       let unknownDiv = informationWrapper.querySelector('[data-catan-tracker="unknown"]');
-      if (!unknownDiv) {
+      if (!shouldRenderUnknown) {
+        // Remove if previously created.
+        unknownDiv?.remove();
+      } else if (!unknownDiv) {
         unknownDiv = document.createElement('div');
         unknownDiv.setAttribute('data-catan-tracker', 'unknown');
         unknownDiv.style.display = 'flex';
@@ -225,11 +238,13 @@
         count.textContent = String(value ?? 0);
       };
 
-      ensureUnknownRow(unknownDiv, 0, '+', store.UnknownStole ?? 0);
-      ensureUnknownRow(unknownDiv, 1, '-', store.UnknownLost ?? 0);
+      if (shouldRenderUnknown && unknownDiv) {
+        ensureUnknownRow(unknownDiv, 0, '+', store.UnknownStole ?? 0);
+        ensureUnknownRow(unknownDiv, 1, '-', store.UnknownLost ?? 0);
 
-      while (unknownDiv.childElementCount > 2) {
-        unknownDiv.removeChild(unknownDiv.lastElementChild);
+        while (unknownDiv.childElementCount > 2) {
+          unknownDiv.removeChild(unknownDiv.lastElementChild);
+        }
       }
     });
   }
