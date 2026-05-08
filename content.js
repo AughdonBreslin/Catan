@@ -13,6 +13,119 @@ const logsCache = new Map(); // index -> { text, processed }
 let lastProcessedLogIndex = null;
 const resourcesState = new Map(); // player -> resource counts
 
+// Development card deck tracking (base game)
+const DEV_DECK_TOTAL = 25;
+const DEV_DECK_TYPES = {
+  knight: 14,
+  roadBuilding: 2,
+  yearOfPlenty: 2,
+  monopoly: 2,
+  victoryPoint: 5,
+};
+
+let devDeckRemaining = DEV_DECK_TOTAL;
+let devDeckLastUpdated = null;
+
+let devDeckKnown = {
+  knight: 0,
+  roadBuilding: 0,
+  yearOfPlenty: 0,
+  monopoly: 0,
+  victoryPoint: 0,
+};
+
+function sumDevDeckKnown() {
+  return Object.values(devDeckKnown).reduce((acc, v) => acc + (Number(v) || 0), 0);
+}
+
+function computeDevDeckBreakdown() {
+  const bought = DEV_DECK_TOTAL - devDeckRemaining;
+  const knownTotal = sumDevDeckKnown();
+  const unknownBought = bought - knownTotal;
+
+  // Remaining-by-type is not uniquely knowable until revealed/played.
+  // We publish a conservative range [min,max] plus an expected value.
+  const totalNotYetKnown = DEV_DECK_TOTAL - knownTotal;
+  const expectedScale = totalNotYetKnown > 0 ? devDeckRemaining / totalNotYetKnown : 0;
+
+  const types = {};
+  Object.entries(DEV_DECK_TYPES).forEach(([key, initial]) => {
+    const known = Number(devDeckKnown[key] || 0);
+    const remainingMax = initial - known;
+    const remainingMin = remainingMax - unknownBought;
+    const expected = remainingMax * expectedScale;
+    types[key] = {
+      initial,
+      known,
+      min: remainingMin,
+      max: remainingMax,
+      expected,
+    };
+  });
+
+  return { bought, knownTotal, unknownBought, types };
+}
+
+function publishDevDeck() {
+  const breakdown = computeDevDeckBreakdown();
+  const payload = {
+    type: 'UPDATE_GAME_DATA',
+    payload: {
+      devDeck: {
+        total: DEV_DECK_TOTAL,
+        remaining: devDeckRemaining,
+        known: { ...devDeckKnown },
+        ...breakdown,
+      },
+      devDeckLastUpdated: devDeckLastUpdated || new Date().toISOString(),
+    },
+  };
+  window.postMessage(payload, '*');
+  window.renderDevDeckRemaining?.();
+}
+
+function setDevDeckRemaining(nextRemaining) {
+  const clamped = Math.max(0, Math.min(DEV_DECK_TOTAL, Number(nextRemaining)));
+  devDeckRemaining = Number.isFinite(clamped) ? clamped : devDeckRemaining;
+  devDeckLastUpdated = new Date().toISOString();
+  // Expose in content-script world for ui-renderer.js
+  window.__catanTrackerDevDeck = {
+    total: DEV_DECK_TOTAL,
+    remaining: devDeckRemaining,
+    known: { ...devDeckKnown },
+    ...computeDevDeckBreakdown(),
+    lastUpdated: devDeckLastUpdated,
+  };
+  publishDevDeck();
+}
+
+function resetDevDeckState() {
+  devDeckKnown = {
+    knight: 0,
+    roadBuilding: 0,
+    yearOfPlenty: 0,
+    monopoly: 0,
+    victoryPoint: 0,
+  };
+  setDevDeckRemaining(DEV_DECK_TOTAL);
+}
+
+function incrementKnownDevCard(typeKey) {
+  if (!typeKey || !(typeKey in DEV_DECK_TYPES)) return;
+  const current = Number(devDeckKnown[typeKey] || 0);
+  const next = Math.min(DEV_DECK_TYPES[typeKey], current + 1);
+  devDeckKnown[typeKey] = next;
+  devDeckLastUpdated = new Date().toISOString();
+  window.__catanTrackerDevDeck = {
+    total: DEV_DECK_TOTAL,
+    remaining: devDeckRemaining,
+    known: { ...devDeckKnown },
+    ...computeDevDeckBreakdown(),
+    lastUpdated: devDeckLastUpdated,
+  };
+  publishDevDeck();
+}
+
 // Function to extract opponent usernames
 function extractOpponentUsernames() {
   const usernames = [];
@@ -133,6 +246,13 @@ function extractGameLogs() {
 const RESOURCE_ALTS = new Set(['lumber', 'brick', 'wool', 'grain', 'ore']);
 const DICE_ALTS = new Set(['dice_1', 'dice_2', 'dice_3', 'dice_4', 'dice_5', 'dice_6']);
 const CARD_ALTS = new Set(['development card', 'resource card']);
+const DEV_CARD_ALTS = new Set([
+  'knight',
+  'road building',
+  'year of plenty',
+  'monopoly',
+  'victory point',
+]);
 
 function buildLogMessage(spanEl) {
   const parts = [];
@@ -142,9 +262,17 @@ function buildLogMessage(spanEl) {
       if (text) parts.push(text);
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       if (node.tagName === 'IMG') {
-        const alt = node.getAttribute('alt').trim().toLowerCase();
-        if (RESOURCE_ALTS.has(alt) || DICE_ALTS.has(alt) || CARD_ALTS.has(alt)) {
-          parts.push(alt);
+        const altRaw = (node.getAttribute('alt') || '').trim().toLowerCase();
+        if (!altRaw) return;
+        if (RESOURCE_ALTS.has(altRaw) || DICE_ALTS.has(altRaw) || CARD_ALTS.has(altRaw)) {
+          parts.push(altRaw);
+          return;
+        }
+
+        // Some dev cards show up with specific alt text. Normalize underscores.
+        const normalized = altRaw.replace(/_/g, ' ');
+        if (DEV_CARD_ALTS.has(normalized)) {
+          parts.push(normalized);
         }
       } else {
         const innerText = node.textContent.trim();
@@ -218,7 +346,6 @@ function publishResources() {
   };
   console.log('[resources] publishing', payload);
   window.postMessage(payload, '*');
-  window.renderPlayerResourcePanels?.();
 }
 
 function parseStartingResources(text) {
@@ -298,11 +425,52 @@ function parseTradeResources(text) {
 }
 
 function parseBoughtDevelopmentCard(text) {
-  const match = text.match(/^(.*?)\s+bought\s+Development Card/i);
+  const match = text.match(/^(.*?)\s+bought\s+Development Card\s*(.*)$/i);
   if (!match) return null;
   const player = match[1] ? match[1].trim() : '';
   if (!player) return null;
-  return { player };
+
+  const rest = (match[2] || '').trim().toLowerCase();
+  /** @type {keyof typeof DEV_DECK_TYPES | null} */
+  let cardType = null;
+  if (rest.includes('road building')) cardType = 'roadBuilding';
+  else if (rest.includes('year of plenty')) cardType = 'yearOfPlenty';
+  else if (rest.includes('victory point')) cardType = 'victoryPoint';
+  else if (rest.includes('monopoly')) cardType = 'monopoly';
+  else if (rest.includes('knight')) cardType = 'knight';
+
+  return { player, cardType };
+}
+
+function parseUsedDevelopmentCard(text) {
+  const lower = (text || '').toLowerCase();
+  if (!lower.includes('used') && !lower.includes('played') && !lower.includes('revealed')) return null;
+
+  const match = text.match(/^(.*?)\s+(used|played|revealed)\s+(.*)$/i);
+  if (!match) return null;
+
+  const player = match[1] ? match[1].trim() : '';
+  const rest = match[3] ? match[3].trim().toLowerCase() : '';
+  if (!player || !rest) return null;
+
+  // Normalize common variants.
+  const normalized = rest
+    .replace(/\bdevelopment\s+card\b/g, '')
+    .replace(/\ba\b/g, '')
+    .replace(/\ban\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  /** @type {keyof typeof DEV_DECK_TYPES | null} */
+  let cardType = null;
+  if (normalized.includes('road building')) cardType = 'roadBuilding';
+  else if (normalized.includes('year of plenty')) cardType = 'yearOfPlenty';
+  else if (normalized.includes('victory point')) cardType = 'victoryPoint';
+  else if (normalized.includes('monopoly')) cardType = 'monopoly';
+  else if (normalized.includes('knight')) cardType = 'knight';
+
+  if (!cardType) return null;
+  return { player, cardType };
 }
 
 function parseBuiltRoad(text) {
@@ -456,6 +624,12 @@ function parseExtraneousPatterns(text) {
   if (lower.includes('has left the game')) {
     return { type: 'extraneous', reason: 'player left message' };
   }
+  if (lower.includes('game paused')) {
+    return { type: 'extraneous', reason: 'game paused message' };
+  }
+  if (lower.includes('game resumed')) {
+    return { type: 'extraneous', reason: 'game resumed message' };
+  }
 
   // Game action messages
   if (lower.includes('rolled')) {
@@ -466,6 +640,12 @@ function parseExtraneousPatterns(text) {
   }
   if (lower.includes('proposed counter offer')) {
     return { type: 'extraneous', reason: 'trade counter offer message' };
+  }
+  if (lower.includes('unblocked trading with')) {
+    return { type: 'extraneous', reason: 'trade unblock message' };
+  }
+  if (lower.includes('blocked trading with')) {
+    return { type: 'extraneous', reason: 'trade block message' };
   }
   if (lower.includes('bot is selecting cards to discard for')) {
     return { type: 'extraneous', reason: 'bot discard message' };
@@ -519,7 +699,7 @@ function classifyResourceLog(text) {
 
   const tookParsed = parseTookResources(text);
   if (tookParsed && tookParsed.resources.length > 0) {
-    return { type: 'gotResources', data: tookParsed };
+    return { type: 'tookResources', data: tookParsed };
   }
 
   const tradeParsed = parseTradeResources(text);
@@ -530,6 +710,11 @@ function classifyResourceLog(text) {
   const boughtCardParsed = parseBoughtDevelopmentCard(text);
   if (boughtCardParsed) {
     return { type: 'boughtDevelopmentCard', data: boughtCardParsed };
+  }
+
+  const usedDevCardParsed = parseUsedDevelopmentCard(text);
+  if (usedDevCardParsed) {
+    return { type: 'usedDevCard', data: usedDevCardParsed };
   }
 
   const builtRoadParsed = parseBuiltRoad(text);
@@ -590,6 +775,12 @@ function processLogsForResources(logs) {
   // resource state. As soon as index 0 becomes available, processing will start.
   if (lastProcessedLogIndex === null && sortedLogs[0]?.index !== 0) {
     return;
+  }
+
+  // If we are starting from the beginning of the log stream, reset dev deck.
+  // (This assumes a fresh game; if you join mid-game we intentionally do not guess.)
+  if (lastProcessedLogIndex === null && sortedLogs[0]?.index === 0) {
+    resetDevDeckState();
   }
 
   let expectedNextIndex = lastProcessedLogIndex === null ? sortedLogs[0].index : lastProcessedLogIndex + 1;
@@ -693,7 +884,7 @@ function processLogsForResources(logs) {
         break;
       }
       case 'boughtDevelopmentCard': {
-        const { player } = classified.data;
+        const { player, cardType } = classified.data;
         const store = ensurePlayerResources(player);
         const bankStore = ensurePlayerResources('Bank');
         
@@ -703,10 +894,21 @@ function processLogsForResources(logs) {
         store['ore']   -= 1; bankStore['ore']   += 1;
         
         updated = true;
+        setDevDeckRemaining(devDeckRemaining - 1);
+        if (cardType) {
+          incrementKnownDevCard(cardType);
+        }
         console.log('[resources] applied bought development card', player, '=>', store);
         logsCache.set(entry.index, { text: entry.text, processed: true });
         processedThisEntry = true;
         normalizePlayerResourceFloors(player, store);
+        break;
+      }
+      case 'usedDevCard': {
+        const { cardType } = classified.data;
+        incrementKnownDevCard(cardType);
+        logsCache.set(entry.index, { text: entry.text, processed: true });
+        processedThisEntry = true;
         break;
       }
       case 'builtRoad': {
@@ -885,6 +1087,7 @@ function processLogsForResources(logs) {
     // also refresh opponents to reflect updated resources
     publishOpponents(extractOpponentUsernames());
   }
+    window.renderPlayerResourcePanels?.();
 }
 
 // Poll until opponents container appears, then extract once to seed state
@@ -1008,6 +1211,15 @@ function initializeObserver() {
     observer.observe(gameDiv, config);
     console.log('Observer started on ui-game div');
     initializeBank();
+    // Seed dev deck state/UI early so it shows immediately.
+    window.__catanTrackerDevDeck = {
+      total: DEV_DECK_TOTAL,
+      remaining: devDeckRemaining,
+      known: { ...devDeckKnown },
+      ...computeDevDeckBreakdown(),
+      lastUpdated: devDeckLastUpdated,
+    };
+    publishDevDeck();
     startOpponentsPoll();
   } else {
     console.log('ui-game div not found, retrying in 1000ms...');

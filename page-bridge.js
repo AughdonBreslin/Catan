@@ -10,6 +10,8 @@
     logsLastUpdated: null,
     unprocessedLogs: [],
     unprocessedLogsLastUpdated: null,
+    devDeck: null,
+    devDeckLastUpdated: null,
     resources: {},
     resourcesLastUpdated: null
   };
@@ -39,6 +41,10 @@
       if (payload.unprocessedLogs) {
         window.gameData.unprocessedLogs = payload.unprocessedLogs;
         window.gameData.unprocessedLogsLastUpdated = payload.unprocessedLogsLastUpdated || payload.lastUpdated || null;
+      }
+      if (payload.devDeck) {
+        window.gameData.devDeck = payload.devDeck;
+        window.gameData.devDeckLastUpdated = payload.devDeckLastUpdated || payload.lastUpdated || null;
       }
       if (payload.resources) {
         window.gameData.resources = payload.resources;

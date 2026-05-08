@@ -42,6 +42,7 @@
   function renderPlayerResourcePanels() {
     // Also patch Bank UI counts (if present) using our tracked Bank store.
     renderBankCountsIfMissing();
+    renderDevDeckRemaining();
 
     // If there's only one opponent, unknown steals/losses are redundant noise.
     const shouldRenderUnknown = getOpponentCountFromDom() > 1;
@@ -317,6 +318,65 @@
     });
   }
 
+  function renderDevDeckRemaining() {
+    // Remove legacy overlay if it exists.
+    document.querySelector('[data-catan-tracker="dev-deck-remaining"]')?.remove();
+
+    const state = window.__catanTrackerDevDeck;
+    const remaining = state?.remaining;
+    if (typeof remaining !== 'number') {
+      document.querySelectorAll('[data-catan-tracker="dev-deck-count-badge"]').forEach((n) => n.remove());
+      return;
+    }
+
+    const bankContainer = document.querySelector('#bank-container');
+    const cardRow = bankContainer?.querySelector('[class*="cardRow-"]');
+    const tooltipTriggers = cardRow?.querySelectorAll('[class*="tooltipTrigger-"]');
+    const lastTrigger = tooltipTriggers && tooltipTriggers.length ? tooltipTriggers[tooltipTriggers.length - 1] : null;
+    if (!lastTrigger) {
+      document.querySelectorAll('[data-catan-tracker="dev-deck-count-badge"]').forEach((n) => n.remove());
+      return;
+    }
+
+    const anyDevCard = lastTrigger.querySelector('[data-card-enum="10"]');
+    const stack = anyDevCard?.closest('[class*="cardStackContainer-"]');
+    const candidates = stack?.querySelectorAll('[data-card-enum="10"]');
+    const target = candidates && candidates.length ? candidates[candidates.length - 1] : null;
+    if (!target) {
+      document.querySelectorAll('[data-catan-tracker="dev-deck-count-badge"]').forEach((n) => n.remove());
+      return;
+    }
+
+    // If Colonist already rendered a badge, leave it alone.
+    const hasNativeBadge = !!target.querySelector('[class*="countBadge-"], [class*="count-"]');
+    if (hasNativeBadge) return;
+
+    let badge = target.querySelector('[data-catan-tracker="dev-deck-count-badge"]');
+    if (!badge) {
+      target.style.position = target.style.position || 'relative';
+
+      badge = document.createElement('div');
+      badge.setAttribute('data-catan-tracker', 'dev-deck-count-badge');
+      badge.style.position = 'absolute';
+      badge.style.right = '0px';
+      badge.style.top = '0px';
+      badge.style.transform = 'translate(30%, -30%)';
+      badge.style.background = 'rgb(0, 114, 188)';
+      badge.style.color = 'white';
+      badge.style.borderRadius = '999px';
+      badge.style.padding = '1px 5px';
+      badge.style.fontSize = '12px';
+      badge.style.lineHeight = '1.2';
+      badge.style.fontVariantNumeric = 'tabular-nums';
+      badge.style.pointerEvents = 'none';
+      badge.style.boxShadow = '0 1px 2px rgba(0,0,0,0.35)';
+
+      target.appendChild(badge);
+    }
+
+    badge.textContent = String(remaining);
+  }
+
   function scheduleRenderPlayerResourcePanels() {
     if (renderPlayerPanelsScheduled) return;
     renderPlayerPanelsScheduled = true;
@@ -329,4 +389,5 @@
   // Expose hooks used by content.js
   window.scheduleRenderPlayerResourcePanels = scheduleRenderPlayerResourcePanels;
   window.renderPlayerResourcePanels = renderPlayerResourcePanels;
+  window.renderDevDeckRemaining = renderDevDeckRemaining;
 })();
